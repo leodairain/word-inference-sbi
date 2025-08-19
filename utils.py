@@ -9,6 +9,7 @@ import torch
 
 import librosa
 from scipy.signal import spectrogram
+from scipy.special import expit
 from scipy.interpolate import interp1d
 from scipy.stats import entropy
 
@@ -31,7 +32,23 @@ import os
 
 warnings.filterwarnings('ignore')
 
+def add_noise_with_snr(clean_signal, noise_signal, snr_db):
+    if len(noise_signal) < len(clean_signal):
+        repeats = int(np.ceil(len(clean_signal) / len(noise_signal)))
+        noise_signal = np.tile(noise_signal, repeats)
+    noise_signal = noise_signal[:len(clean_signal)]
 
+    clean_power = np.mean(clean_signal ** 2)
+    noise_power = np.mean(noise_signal ** 2)
+
+    target_noise_power = clean_power / (10 ** (snr_db / 10))
+
+    scale = np.sqrt(target_noise_power / noise_power)
+    scaled_noise = noise_signal * scale
+
+    noisy_signal = clean_signal + scaled_noise
+
+    return noisy_signal
 
 def reduced_interpolated_spectrogram(signal, fs, bands=6, target_time_steps=8):
     """
@@ -307,7 +324,7 @@ def compute_discrete_posterior(samples, embedding, old_prior, new_prior, T1, bet
 
 def compute_prob_words(prob_words, p_follow, discrete_posterior, T2, alpha=.5):
     p_follow_with_posterior = np.dot(p_follow, discrete_posterior)
-    p_follow_with_posterior = np.log(softmax_temperature(p_follow_with_posterior, 1))
+    p_follow_with_posterior = np.log(softmax_temperature(p_follow_with_posterior, 0.01))
 
     prob_words = (1-alpha)*np.log(prob_words / np.sum(prob_words)) + (alpha)*p_follow_with_posterior
     prob_words += (np.max(abs(prob_words)))
@@ -880,6 +897,357 @@ def sequential_inference_3d_words_sequences_classes(path,
 
 
     return res, res_wp_syll, res_wp_words, resyll, resyll_by_count
+
+def sequential_inference_noisy(path, 
+                                  embedding, 
+                                  posterior, 
+                                  unique_words_sequences, all_aligned_sylls, 
+                                  all_spectrograms, 
+                                  unique_syllable_labels,syll2idx, count_syll,
+                                  classes, count_classes,
+                                  snr,
+                                  sigma, 
+                                  T1, T2, T3, 
+                                  alpha, beta):
+    
+   
+    
+    num_syll = len(unique_syllable_labels)
+    num_syll_tot = len(classes)
+
+    num_words = len(unique_words_sequences)
+
+
+    signal, fs =  librosa.load(path + '.wav', sr=None, mono=True)
+    signal = signal.astype(np.float32)
+    noise = np.random.normal(0,1,signal.shape)
+    noisy_signal = add_noise_with_snr(signal, noise, snr)
+    
+
+    sylls = pd.read_csv(path + '.sylbtime',
+                        sep='\t', header=None, names=['onset', 'offset', 'label'])
+
+    words = pd.read_csv(path + '.WRD',
+                        sep=' ', header=None, names=['onset', 'offset', 'label'])
+
+
+
+    aligned_words, aligned_sylls = align_syll_words(sylls, words)
+
+
+    spectrograms = []
+    bands, target_time_steps = all_spectrograms[0].shape
+    for i in range(len(sylls)):
+        onset, offset = int(sylls['onset'][i]), int(sylls['offset'][i])
+        syll_signal = noisy_signal[onset:offset]
+
+                    
+        S = reduced_interpolated_spectrogram(syll_signal, fs, bands=bands, target_time_steps=target_time_steps)
+        spectrograms.append(torch.tensor(S.flatten() / np.max(S.flatten()), dtype=torch.float32))
+
+    
+    res = np.zeros(len(aligned_words))
+    res_wp_syll = np.zeros(len(aligned_words))
+    res_wp_words = np.zeros(len(aligned_words))
+
+    resyll = []
+    resyll_wp_words = []
+    resyll_by_count = {i+1:[] for i in range(count_syll[max(count_syll, key=lambda x : count_syll[x])])}
+
+
+    resyll_by_words = []
+    resyll_by_words_wp_words = []
+
+
+    i_sentence = 0
+    for w, seq in enumerate(aligned_sylls):
+        
+        resyll_w = []
+        resyll_w_wp_words = []
+        
+        prob_words = np.ones(num_words) / num_words
+        prob_words_wp_syll = np.ones(num_words) / num_words
+        prob_words_wp_words = np.ones(num_words) / num_words
+
+        prior_syll_v = torch.tensor(
+            [j==classes.index(unique_syllable_labels.index(seq[0])) for j in range(num_syll_tot)], 
+            dtype=torch.float32)
+        # prior_syll = build_prior(prior_syll_v, embedding, sigma)
+
+        prior_words_v_classes = np.ones(num_syll_tot)/num_syll_tot
+        # prior_words = build_prior(prior_words_v, embedding, sigma)
+
+        prior_words_v = np.ones(num_syll)/num_syll
+
+        for i, syll in enumerate(seq):
+            # plt.figure()
+            # plt.plot(prior_words_v)
+            # plt.axvline(syll2idx[syll], c='r', linestyle='--')
+            # plt.show()
+
+
+            pw_entropy_np = entropy(prob_words) / np.log(num_words)
+            pw_entropy_wp_words = entropy(prob_words_wp_words) / np.log(num_words)
+
+           
+
+            #########################################################################################
+            ########### (a) Use the inference network to infer the posterior distribution ###########
+            #########################################################################################
+            
+            xi = spectrograms[i_sentence]
+            i_sentence+=1
+
+
+            # print(pw_entropy_wp_words)
+
+            # Compute Posterior with flat prior
+            # print("Computing Posteriors ...")
+
+            discrete_posterior_all = softmax_temperature(
+                posterior.log_prob(embedding, xi).detach(), T1
+                )
+            
+            
+            
+            discrete_posterior = np.array(
+                [np.sum(discrete_posterior_all[np.where(np.array(classes)==i)[0]]) for i in range(num_syll)]
+            )
+            
+            
+
+            entropy_np = entropy(discrete_posterior) / np.log(num_syll)
+
+            
+            resyll.append(int(np.argmax(discrete_posterior)==syll2idx[syll]))
+            resyll_w.append(int(np.argmax(discrete_posterior)==syll2idx[syll]))
+            resyll_by_count[count_syll[syll]].append(int(np.argmax(discrete_posterior)==syll2idx[syll]))
+
+            # Compute Posterior with word modulated prior
+            # discrete_posterior_wp_syll = softmax_temperature(
+            #     (1-beta)*posterior.log_prob(embedding, xi).detach() + beta*prior_syll.log_prob(embedding).detach(), T1
+            #     )
+            discrete_posterior_wp_syll = softmax_temperature(
+                [j==syll2idx[syll] for j in range(num_syll)]
+            )
+
+            # eta = pw_entropy_wp_words**beta
+            eta=1 if i==0 else beta
+            # print(eta.round(4))
+            discrete_posterior_wp_words_all = softmax_temperature(
+                eta*posterior.log_prob(embedding, xi).detach() + (1-eta)*np.log(prior_words_v_classes), T1
+                )
+            
+            
+            
+            discrete_posterior_wp_words = np.array(
+                [np.sum(discrete_posterior_wp_words_all[np.where(np.array(classes)==i)[0]]) for i in range(num_syll)]
+            )
+            resyll_wp_words.append(int(np.argmax(discrete_posterior_wp_words)==syll2idx[syll]))
+            resyll_w_wp_words.append(int(np.argmax(discrete_posterior_wp_words)==syll2idx[syll]))
+            
+            # print(torch.median(posterior.log_prob(embedding, xi).detach()), np.median(np.log(prior_words_v_classes)))
+            
+            entropy_wp_words = entropy(discrete_posterior_wp_words) / np.log(num_syll)
+            
+
+            # plt.figure()
+            # plt.plot(discrete_posterior, label='Posterior only')
+            # plt.plot(discrete_posterior_wp_words, label='Posterior + prior')
+            # plt.plot(prior_words_v, label='Prior')
+            # plt.axvline(syll2idx[syll], c='r', linestyle='--')
+            # plt.legend()
+            # plt.show()
+            # print(np.unique(prior_words_v))
+
+            ##################################################################
+            ########### (b) Compute the updated word probabilities ###########
+            ##################################################################
+            # print("Updating Word Probabilites ...")
+
+            numerator_follow = np.array(
+                [
+                    [
+                        1 if ((len(word_seq)>i) and (word_seq[i]==s)) else 0.1
+                        for s in unique_syllable_labels
+                    ] 
+                    for word_seq in unique_words_sequences
+                ]
+            ) 
+
+            
+            p_follow = numerator_follow / np.sum(numerator_follow + 1e-10, axis=-1, keepdims=True) 
+            # p_follow = np.round(p_follow)
+
+            # plt.figure()
+            # plt.pcolormesh(p_follow)
+            # plt.show()
+
+            # Flat prior
+            weight_past_estimates = (1 /(1+ alpha * entropy_np))
+            # weight_past_estimates = alpha
+            prob_words = compute_prob_words(prob_words, p_follow, discrete_posterior, T2, weight_past_estimates)
+            
+            # Syllable Prior
+            prob_words_wp_syll = compute_prob_words(prob_words_wp_syll, p_follow, discrete_posterior_wp_syll, T2, 0.5)
+
+            # Word Prior
+            weight_past_estimates_wp_words = (1 /(1+ alpha* entropy_wp_words))
+            # weight_past_estimates_wp_words = alpha
+            prob_words_wp_words = compute_prob_words(prob_words_wp_words, p_follow, discrete_posterior_wp_words, T2, 0.5)
+            # print((1 /(1+ alpha* entropy_wp_words))) 
+
+            # plt.figure(figsize=(16,3))
+            # plt.subplot(1,4,1)
+            # plt.plot(prior_words_v)
+            # plt.title("Prior")
+            # plt.axvline(syll2idx[syll], c='r', linestyle='--')
+
+            # plt.subplot(1,4,2)
+            # plt.plot(discrete_posterior)
+            # plt.title("Posterior Without Prior")
+            # plt.axvline(syll2idx[syll], c='r', linestyle='--')
+
+            # plt.subplot(1,4,3)
+            # plt.plot(discrete_posterior_wp_words)
+            # plt.title("Posterior With Prior")
+            # plt.axvline(syll2idx[syll], c='r', linestyle='--')
+
+            # plt.subplot(1,4,4)
+            # plt.plot(prob_words, label='No Prior')
+            # plt.plot(prob_words_wp_words, label='With Prior')
+            # plt.axvline(x=unique_words_sequences.index(seq), c='r', linestyle='--')
+            # plt.title("Word Probabilities")
+            # plt.legend()
+
+            # plt.suptitle(f"Word {w}/{len(aligned_sylls)}, Syllable {i+1}/{len(seq)}")
+            
+
+            
+            # plt.tight_layout()
+            # plt.show()
+            
+
+            
+            ##########################################################################
+            ########### (c) Compute the global syllable transition network ###########
+            ##########################################################################
+            # global_syllable_network = np.sum(
+            #     np.array([prob_words_wp_words[l] * transition_matrices_words[all_aligned_words[l]] for l in range(num_words)]),
+            #     axis=0
+            #     )
+            
+            # print("Computing New Prior")
+            global_syllable_network = np.sum(
+                [prob_words_wp_words[l] * np.array(
+                
+                [
+                    [
+                        1
+                        if ((len(unique_words_sequences[l])>i+1) and (unique_words_sequences[l][i]==s1) and (unique_words_sequences[l][i+1]==s2)) 
+                        else 0.0
+                        for s2 in unique_syllable_labels
+                    ] 
+                    for s1 in unique_syllable_labels
+                ])
+                for l in range(num_words)
+                ],
+            axis=0) 
+
+            next_syll = np.sum(
+                [(1*prob_words_wp_words[l]) * np.array(
+                
+                [
+                    1
+                    if ((len(unique_words_sequences[l])>i+1) and (unique_words_sequences[l][i+1]==s)) 
+                    else 0.05
+                    for s in unique_syllable_labels
+                ])
+                for l in range(num_words)
+                ],
+            axis=0)
+
+            
+
+            
+            
+
+            
+  
+            ##################################################
+            ########### (d) Compute the next prior ###########
+            ##################################################
+            
+
+            
+            prior_words_v = torch.tensor(
+                softmax_temperature(discrete_posterior_wp_words @ global_syllable_network, T3),
+                dtype=torch.float32
+                )
+            
+            prior_words_v = torch.tensor(
+                softmax_temperature(next_syll, T3),
+                dtype=torch.float32
+                )
+            
+            prior_words_v_classes = np.array(
+                [prior_words_v[c] / count_classes[classes[c]] for c in classes]
+            )
+            
+            
+            # print(np.unique(prior_words_v))
+            # plt.figure()
+            # plt.subplot(2,1,1)
+            # plt.pcolormesh(global_syllable_network)
+            # plt.subplot(2,1,2)
+            # plt.plot(prior_words_v)
+            # if len(all_aligned_sylls[w])>i+1:
+            #     plt.axvline(syll2idx[all_aligned_sylls[w][i+1]], c='r')
+            # plt.show()
+
+
+            
+            # prior_words = build_prior(prior_words_v, embedding, sigma)
+            # clear_output(wait=True)
+
+            # plt.figure()
+            # plt.subplot(3,1,1)
+            # plt.plot(prior_syll_v)
+            # plt.title(f"Syllable Prior {w} - {i}")
+            # plt.axvline(torch.argmax(prior_syll_v), c='r', linestyle='--')
+
+            # plt.subplot(3,1,2)
+            # plt.plot(prior_words_v)
+            # plt.title(f"Word Prior {w} - {i}")
+            # plt.axvline(torch.argmax(prior_syll_v), c='r', linestyle='--')
+            # plt.tight_layout()
+            # plt.show()
+
+            # plt.subplot(3,1,3)
+            # plt.plot(discrete_posterior_wp_words)
+            # plt.title(f"Posterior {w} - {i}")
+            # plt.axvline(syll2idx[syll], c='orange', linestyle='--')
+            # plt.tight_layout()
+            # plt.show()
+
+            gc.collect()
+
+
+        if np.argmax(prob_words_wp_syll)!=unique_words_sequences.index(seq):
+            print(unique_words_sequences[np.argmax(prob_words_wp_syll)], seq)
+
+        res[w] = int(np.argmax(prob_words)==unique_words_sequences.index(seq))
+        res_wp_syll[w] = int(np.argmax(prob_words_wp_syll)==unique_words_sequences.index(seq))
+        res_wp_words[w] = int(np.argmax(prob_words_wp_words)==unique_words_sequences.index(seq))
+
+        resyll_by_words.append(resyll_w)
+        resyll_by_words_wp_words.append(resyll_w_wp_words)
+        
+        prior_words_v_classes = np.ones(num_syll_tot)/num_syll_tot
+
+        # prior_words = build_prior(prior_words_v, embedding, sigma)
+
+    return res, res_wp_syll, res_wp_words, resyll, resyll_wp_words, resyll_by_count, resyll_by_words, resyll_by_words_wp_words
 
 def build_simulator(embedding, syll2spectrogram, sigma=0.05):
         def simulator(theta):
